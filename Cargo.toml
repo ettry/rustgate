@@ -1,0 +1,42 @@
+[package]
+name = "rustgate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rustgate"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio-stream = "0.1"
+aho-corasick = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# 管理 API + WebSocket 实时告警
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.24"
+
+# HTTPS 后端支持（TLS client）
+hyper-rustls = { version = "0.27", features = ["http1", "tls12", "ring"] }
+rustls = "0.23"
+rustls-native-certs = "0.8"
+
+[dev-dependencies]
+futures-util = "0.3"
+
+# 发布构建：面向生产部署的优化（更小、更快）
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+

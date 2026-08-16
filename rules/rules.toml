@@ -1,0 +1,89 @@
+# RustGate 规则配置
+# score_threshold: 单个请求命中规则累计分数 >= 该阈值时拦截
+score_threshold = 20
+
+# CC 限流（令牌桶）：每 IP 桶容量 / 每秒补充速率
+cc_capacity = 100
+cc_refill_per_sec = 10
+
+#
+# —— 规则条目 ——
+# field 可选: Url | Args | Header | Body | Method
+# pattern 为字面量时由 aho-corasick(Aho-Corasick 自动机) 多模式匹配，
+# 以 "regex:" 前缀开头时走 regex 正则匹配。
+#
+# field = "Header" 时可选加 header = "User-Agent"/"Cookie"/"Referer" 等，
+# 表示只匹配该名称的 header；不填则匹配所有 header 的拼接串。
+#
+
+[[rules]]
+id = 1
+name = "SQLi: union select"
+category = "sqli"
+field = "Args"
+pattern = "union select"
+score = 20
+
+[[rules]]
+id = 2
+name = "SQLi: 内部注释绕过"
+category = "sqli"
+field = "Args"
+pattern = "regex:(?i)(\\bor\\b|\\band\\b)\\s+\\d+\\s*=\\s*\\d+"
+score = 20
+
+[[rules]]
+id = 3
+name = "SQLi: 单引号恒真"
+category = "sqli"
+field = "Args"
+pattern = "regex:(?i)'\\s*or\\s*'1'='1"
+score = 20
+
+[[rules]]
+id = 4
+name = "XSS: script 标签"
+category = "xss"
+field = "Body"
+pattern = "<script"
+score = 25
+
+[[rules]]
+id = 5
+name = "路径穿越"
+category = "traversal"
+field = "Url"
+pattern = "regex:\\.\\.(/|%2f|%5c)"
+score = 20
+
+[[rules]]
+id = 6
+name = "XSS: img onerror"
+category = "xss"
+field = "Body"
+pattern = "regex:(?i)onerror\\s*="
+score = 25
+
+[[rules]]
+id = 7
+name = "命令注入: 管道/分号拼接"
+category = "cmdi"
+field = "Args"
+pattern = "regex:(?i)([;&|]|\\$\\()\\s*(cat|ls|id|whoami|pwd|wget|curl|nc|sh|bash|echo|rm|touch|ping|nslookup)"
+score = 25
+
+[[rules]]
+id = 8
+name = "命令注入: 反引号执行"
+category = "cmdi"
+field = "Args"
+pattern = "regex:(?i)`[a-z0-9_\\- ]+`"
+score = 25
+
+[[rules]]
+id = 9
+name = "命令注入: 常见命令关键字"
+category = "cmdi"
+field = "Body"
+pattern = "regex:(?i)\\b(cat|/etc/passwd|whoami|ls\\s+-la|wget\\s+http|curl\\s+http)\\b"
+score = 25

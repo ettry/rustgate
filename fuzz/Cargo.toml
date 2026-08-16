@@ -1,0 +1,29 @@
+[package]
+name = "rustgate-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rustgate]
+path = ".."
+
+[dependencies.hyper]
+version = "1"
+features = ["full"]
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "engine_fuzz"
+path = "fuzz_targets/engine_fuzz.rs"
+test = false
+doc = false
+bench = false

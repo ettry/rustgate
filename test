@@ -1,0 +1,24 @@
+RUSTGATE_CONFIG_DIR=/tmp/rustgate-cfg 设置临时配置文件用于测试
+# ============ SQL 注入 ============
+# 1. union select（应 403）
+curl "http://127.0.0.1:9000/index.php?id=1%20union%20select"
+
+# 2. 恒真注入（应 403）
+curl "http://127.0.0.1:9000/a?id=%27%20or%20%271%27=%271"
+
+# 3. NUL 截断绕过（应 403，这是归一化的亮点）
+curl "http://127.0.0.1:9000/a?id=1+union%00select"
+
+# ============ 路径穿越 ============
+# 必须加 --path-as-is（应 403）
+curl --path-as-is "http://127.0.0.1:9000/../../etc/passwd"
+
+# ============ XSS（POST body）============
+# 4. script 标签（应 403）
+curl -X POST -d '<script>alert(1)</script>' "http://127.0.0.1:9000/login"
+
+# 5. onerror 事件（应 403）
+curl -X POST -d '<img src=x onerror=alert(1)>' "http://127.0.0.1:9000/login"
+
+# ============ 正常请求（对照，应 200）============
+curl "http://127.0.0.1:9000/index.php?id=1"

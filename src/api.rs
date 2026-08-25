@@ -272,6 +272,9 @@ async fn stream_alerts(mut socket: WebSocket, bus: Arc<AlertBus>) {
     let mut rx = bus.subscribe();
     let mut heartbeat = tokio::time::interval(WS_HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // tokio interval 第一次 tick 会立即触发；先消费掉，避免刚建立连接就立刻发一个
+    // 心跳 Ping，与首条告警抢占顺序（否则慢环境下客户端会先收到 Ping 而非告警）。
+    heartbeat.tick().await;
 
     loop {
         tokio::select! {

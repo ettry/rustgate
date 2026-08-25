@@ -3,15 +3,15 @@
 ## 运行 QA 端到端测试
 
 ```bash
-bash qa/run_qa.sh
+bash tests/qa/run_qa.sh
 ```
 
 预期输出 `10 通过, 0 失败`。
 
 ## BDD (Gherkin) 场景
 
-`qa/features/waf.feature` 用标准 Gherkin 语法描述防护行为。
-每个 `场景` 与 `qa/run_qa.sh` 中的 `check` 用例一一对应：
+`tests/qa/features/waf.feature` 用标准 Gherkin 语法描述防护行为。
+每个 `场景` 与 `tests/qa/run_qa.sh` 中的 `check` 用例一一对应：
 
 | Gherkin 场景 | run_qa.sh 用例 |
 |---|---|

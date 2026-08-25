@@ -1,4 +1,8 @@
 RUSTGATE_CONFIG_DIR=/tmp/rustgate-cfg 设置临时配置文件用于测试
+测试服务器为ddns.eipc.store
+19191为https的waf端口
+19192为网页默认端口用作对比
+19193为ui端口
 # ============ SQL 注入 ============
 # 1. union select（应 403）
 curl "http://127.0.0.1:9000/index.php?id=1%20union%20select"

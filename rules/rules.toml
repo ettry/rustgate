@@ -7,7 +7,7 @@ cc_capacity = 100
 cc_refill_per_sec = 10
 
 #
-# —— 规则条目 ——
+# -- 规则条目 --
 # field 可选: Url | Args | Header | Body | Method
 # pattern 为字面量时由 aho-corasick(Aho-Corasick 自动机) 多模式匹配，
 # 以 "regex:" 前缀开头时走 regex 正则匹配。
@@ -15,6 +15,22 @@ cc_refill_per_sec = 10
 # field = "Header" 时可选加 header = "User-Agent"/"Cookie"/"Referer" 等，
 # 表示只匹配该名称的 header；不填则匹配所有 header 的拼接串。
 #
+# -- 计分设计（阈值 20）--
+# * 决定性特征（union select、${jndi:、webshell 函数等）：单条 20~25 分，一击拦截；
+# * 弱信号（后台路径探测、备份文件后缀等）：单条 10~15 分，
+#   需与其它信号叠加才到阈值，降低正常业务误杀；
+# * Url 字段 = path + query（已解码），Args = 仅 query，Body = 请求体前缀；
+#   同一攻击出现在不同字段（如 SQLi 在 query/body/path）分别建规则覆盖。
+#
+# -- 规则参考来源 --
+# * OWASP CRS (coreruleset.org)：攻击分类与阈值设计思路
+# * PayloadsAllTheThings：各攻击类型的真实 payload 特征
+# * SecLists：扫描器 User-Agent / 敏感路径字典
+#
+
+# ============================================================
+# SQL 注入（sqli）
+# ============================================================
 
 [[rules]]
 id = 1
@@ -41,12 +57,184 @@ pattern = "regex:(?i)'\\s*or\\s*'1'='1"
 score = 20
 
 [[rules]]
+id = 10
+name = "SQLi: union select（请求体）"
+category = "sqli"
+field = "Body"
+pattern = "union select"
+score = 20
+
+[[rules]]
+id = 11
+name = "SQLi: union select（路径）"
+category = "sqli"
+field = "Url"
+pattern = "union select"
+score = 20
+
+[[rules]]
+id = 12
+name = "SQLi: 注释混淆 union/**/select"
+category = "sqli"
+field = "Args"
+pattern = "regex:(?i)\\bunion[\\s/*]{1,16}select\\b"
+score = 25
+
+[[rules]]
+id = 13
+name = "SQLi: union all select"
+category = "sqli"
+field = "Args"
+pattern = "union all select"
+score = 25
+
+[[rules]]
+id = 14
+name = "SQLi: 时间盲注（query）"
+category = "sqli"
+field = "Args"
+pattern = "regex:(?i)\\b(sleep|benchmark|pg_sleep|waitfor\\s+delay)\\s*\\("
+score = 20
+
+[[rules]]
+id = 15
+name = "SQLi: 时间盲注（body）"
+category = "sqli"
+field = "Body"
+pattern = "regex:(?i)\\b(sleep|benchmark|pg_sleep|waitfor\\s+delay)\\s*\\("
+score = 20
+
+[[rules]]
+id = 16
+name = "SQLi: 报错注入 extractvalue/updatexml"
+category = "sqli"
+field = "Args"
+pattern = "regex:(?i)\\b(extractvalue|updatexml)\\s*\\("
+score = 20
+
+[[rules]]
+id = 17
+name = "SQLi: 堆叠查询/破坏性语句"
+category = "sqli"
+field = "Args"
+pattern = "regex:(?i);\\s*(drop|delete|insert|update|truncate)\\b"
+score = 25
+
+[[rules]]
+id = 18
+name = "SQLi: information_schema 系统表探测"
+category = "sqli"
+field = "Args"
+pattern = "information_schema"
+score = 20
+
+[[rules]]
+id = 19
+name = "NoSQL 注入: $where/$ne/$gt/$regex 操作符"
+category = "nosqli"
+field = "Args"
+pattern = "regex:(?i)\\$where|\\$ne\\s*:|\\$gt\\s*:|\\$regex\\s*:"
+score = 20
+
+# ============================================================
+# XSS（xss）
+# ============================================================
+
+[[rules]]
 id = 4
 name = "XSS: script 标签"
 category = "xss"
 field = "Body"
 pattern = "<script"
 score = 25
+
+[[rules]]
+id = 6
+name = "XSS: img onerror"
+category = "xss"
+field = "Body"
+pattern = "regex:(?i)onerror\\s*="
+score = 25
+
+[[rules]]
+id = 20
+name = "XSS: script 标签（query）"
+category = "xss"
+field = "Args"
+pattern = "<script"
+score = 25
+
+[[rules]]
+id = 21
+name = "XSS: 事件处理器注入（query）"
+category = "xss"
+field = "Args"
+pattern = "regex:(?i)\\bon(error|load|click|mouseover|focus|blur|submit|toggle)\\s*="
+score = 20
+
+[[rules]]
+id = 22
+name = "XSS: javascript 伪协议（query）"
+category = "xss"
+field = "Args"
+pattern = "javascript:"
+score = 25
+
+[[rules]]
+id = 23
+name = "XSS: javascript 伪协议（body）"
+category = "xss"
+field = "Body"
+pattern = "javascript:"
+score = 25
+
+[[rules]]
+id = 24
+name = "XSS: alert/confirm/prompt 探测（body）"
+category = "xss"
+field = "Body"
+pattern = "regex:(?i)\\b(alert|confirm|prompt)\\s*\\("
+score = 20
+
+[[rules]]
+id = 25
+name = "XSS: 危险标签注入（query）"
+category = "xss"
+field = "Args"
+pattern = "regex:(?i)<(iframe|svg|embed|object|marquee)\\b"
+score = 15
+
+[[rules]]
+id = 26
+name = "XSS: 危险标签注入（body）"
+category = "xss"
+field = "Body"
+pattern = "regex:(?i)<(iframe|svg|embed|object|marquee)\\b"
+score = 15
+
+[[rules]]
+id = 27
+name = "XSS: document.cookie 窃取"
+category = "xss"
+field = "Body"
+pattern = "document.cookie"
+score = 20
+
+# ============================================================
+# XXE（xxe）
+# ============================================================
+
+[[rules]]
+id = 30
+name = "XXE: 外部实体注入"
+category = "xxe"
+field = "Body"
+pattern = "regex:(?i)<!ENTITY|<!DOCTYPE[^>]{0,256}SYSTEM"
+score = 25
+
+# ============================================================
+# 路径穿越 / LFI / 信息泄露（traversal / lfi）
+# ============================================================
 
 [[rules]]
 id = 5
@@ -57,12 +245,136 @@ pattern = "regex:\\.\\.(/|%2f|%5c)"
 score = 20
 
 [[rules]]
-id = 6
-name = "XSS: img onerror"
-category = "xss"
-field = "Body"
-pattern = "regex:(?i)onerror\\s*="
+id = 31
+name = "LFI: 敏感系统文件读取"
+category = "lfi"
+field = "Url"
+pattern = "regex:(?i)/etc/(passwd|shadow|group|hosts)|/proc/self|c:\\\\+windows|win\\.ini|boot\\.ini"
 score = 25
+
+[[rules]]
+id = 32
+name = "LFI: PHP 流包装器/文件协议"
+category = "lfi"
+field = "Url"
+pattern = "regex:(?i)(php|data|expect|zip|phar|file)://"
+score = 25
+
+[[rules]]
+id = 33
+name = "信息泄露: .git/.svn/.hg 目录"
+category = "lfi"
+field = "Url"
+pattern = "regex:(?i)/\\.(git|svn|hg)(/|$)"
+score = 25
+
+# ============================================================
+# RCE / SSTI / 反序列化 / 模板注入（rce）
+# ============================================================
+
+[[rules]]
+id = 40
+name = "Log4Shell: JNDI 注入（query）"
+category = "rce"
+field = "Args"
+pattern = "${jndi:"
+score = 25
+
+[[rules]]
+id = 41
+name = "Log4Shell: JNDI 注入（body）"
+category = "rce"
+field = "Body"
+pattern = "${jndi:"
+score = 25
+
+[[rules]]
+id = 42
+name = "Log4Shell: JNDI 注入（任意 header）"
+category = "rce"
+field = "Header"
+pattern = "${jndi:"
+score = 25
+
+[[rules]]
+id = 43
+name = "SSTI: ${7*7} 模板探测（query）"
+category = "ssti"
+field = "Args"
+pattern = "${7*7}"
+score = 20
+
+[[rules]]
+id = 44
+name = "SSTI: ${7*7} 模板探测（body）"
+category = "ssti"
+field = "Body"
+pattern = "${7*7}"
+score = 20
+
+[[rules]]
+id = 45
+name = "SSTI: Jinja {{...}} 模板探测"
+category = "ssti"
+field = "Args"
+pattern = "regex:\\{\\{[^}]{0,64}\\}\\}"
+score = 20
+
+[[rules]]
+id = 46
+name = "Webshell: PHP 危险函数执行超全局变量"
+category = "rce"
+field = "Body"
+pattern = "regex:(?i)\\b(eval|assert|system|passthru|shell_exec|popen|exec)\\s*\\(\\s*\\$_(GET|POST|REQUEST|COOKIE)"
+score = 25
+
+[[rules]]
+id = 47
+name = "Webshell: base64 隐蔽载荷"
+category = "rce"
+field = "Body"
+pattern = "regex:(?i)base64_decode\\s*\\(\\s*\\$"
+score = 20
+
+[[rules]]
+id = 48
+name = "反序列化: Java 序列化魔术头 rO0AB"
+category = "rce"
+field = "Body"
+pattern = "rO0AB"
+score = 25
+
+[[rules]]
+id = 49
+name = "Webshell: Java Runtime 执行"
+category = "rce"
+field = "Body"
+pattern = "Runtime.getRuntime"
+score = 20
+
+# ============================================================
+# SSRF（ssrf）
+# ============================================================
+
+[[rules]]
+id = 50
+name = "SSRF: 内网/云元数据地址（query）"
+category = "ssrf"
+field = "Args"
+pattern = "regex:(?i)https?://(127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0|169\\.254\\.169\\.254|metadata\\.google\\.internal|\\[::1\\])"
+score = 25
+
+[[rules]]
+id = 51
+name = "SSRF: 内网/云元数据地址（body）"
+category = "ssrf"
+field = "Body"
+pattern = "regex:(?i)https?://(127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0|169\\.254\\.169\\.254|metadata\\.google\\.internal|\\[::1\\])"
+score = 25
+
+# ============================================================
+# 命令注入（cmdi）
+# ============================================================
 
 [[rules]]
 id = 7
@@ -87,3 +399,60 @@ category = "cmdi"
 field = "Body"
 pattern = "regex:(?i)\\b(cat|/etc/passwd|whoami|ls\\s+-la|wget\\s+http|curl\\s+http)\\b"
 score = 25
+
+# ============================================================
+# 扫描器识别 / 敏感路径探测（scanner）
+# ============================================================
+
+[[rules]]
+id = 60
+name = "扫描器: 攻击工具 User-Agent"
+category = "scanner"
+field = "Header"
+header = "User-Agent"
+pattern = "regex:(?i)\\b(sqlmap|nikto|nmap|masscan|zgrab|dirbuster|gobuster|wpscan|acunetix|nessus|havij|w3af|arachni|whatweb|openvas|qualys|feroxbuster)\\b"
+score = 25
+
+[[rules]]
+id = 61
+name = "探测: 敏感配置/密钥文件"
+category = "scanner"
+field = "Url"
+pattern = "regex:(?i)/(\\.env|\\.aws/credentials|\\.htaccess|\\.htpasswd|\\.DS_Store|\\.bash_history|id_rsa|\\.ssh/)"
+score = 25
+
+[[rules]]
+id = 62
+name = "探测: CMS 后台/框架调试路径"
+category = "scanner"
+field = "Url"
+pattern = "regex:(?i)/(wp-login\\.php|wp-admin|xmlrpc\\.php|phpmyadmin|administrator|vendor/phpunit|actuator)"
+score = 15
+
+[[rules]]
+id = 63
+name = "探测: 备份/导出文件后缀"
+category = "scanner"
+field = "Url"
+pattern = "regex:(?i)\\.(bak|backup|old|orig|save|swp|sql|dump)\\b"
+score = 15
+
+# ============================================================
+# HTTP 方法滥用（method）
+# ============================================================
+
+[[rules]]
+id = 70
+name = "方法滥用: TRACE 跟踪"
+category = "method"
+field = "Method"
+pattern = "TRACE"
+score = 20
+
+[[rules]]
+id = 71
+name = "方法滥用: CONNECT 隧道"
+category = "method"
+field = "Method"
+pattern = "CONNECT"
+score = 20

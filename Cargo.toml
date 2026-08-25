@@ -31,6 +31,10 @@ hyper-rustls = { version = "0.27", features = ["http1", "tls12", "ring"] }
 rustls = "0.23"
 rustls-native-certs = "0.8"
 
+# 前端 HTTPS 监听支持（TLS server）
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
 [dev-dependencies]
 futures-util = "0.3"
 
@@ -39,4 +43,3 @@ futures-util = "0.3"
 lto = "thin"
 codegen-units = 1
 strip = true
-

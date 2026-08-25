@@ -1,0 +1,49 @@
+󰣇 ~ ❯ oha -z 30s -c 200 "https://ddns.eipc.store:19191/?q=1+union+select"
+Summary:
+  Success rate:	99.35%
+  Total:	30.0044 sec
+  Slowest:	18.7343 sec
+  Fastest:	0.0272 sec
+  Average:	0.6625 sec
+  Requests/sec:	269.0936
+
+  Total data:	137.51 KiB
+  Size/request:	18 B
+  Size/sec:	4.58 KiB
+
+Response time histogram:
+   0.027 sec [1]    |
+   1.898 sec [7130] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+   3.769 sec [463]  |■■
+   5.639 sec [133]  |
+   7.510 sec [57]   |
+   9.381 sec [20]   |
+  11.251 sec [11]   |
+  13.122 sec [3]    |
+  14.993 sec [3]    |
+  16.864 sec [1]    |
+  18.734 sec [1]    |
+
+Response time distribution:
+  10.00% in 0.0425 sec
+  25.00% in 0.0503 sec
+  50.00% in 0.2019 sec
+  75.00% in 0.7501 sec
+  90.00% in 1.6691 sec
+  95.00% in 2.7943 sec
+  99.00% in 5.9489 sec
+  99.90% in 11.3520 sec
+  99.99% in 18.7343 sec
+
+
+Details (average, fastest, slowest):
+  DNS+dialup:	1.8554 sec, 0.1993 sec, 4.8851 sec
+  DNS-lookup:	0.0148 sec, 0.0014 sec, 0.0327 sec
+
+Status code distribution:
+  [403] 7823 responses
+
+Error distribution:
+  [200] aborted due to deadline
+  [37] timeout
+  [14] connection error

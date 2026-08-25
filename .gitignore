@@ -15,9 +15,9 @@ tarpaulin-report.html
 cobertura.xml
 
 # Fuzz（构建产物与语料库；fuzz_targets/ 与 Cargo.toml 保留）
-fuzz/target/
-fuzz/corpus/
-fuzz/artifacts/
+tests/fuzz/target/
+tests/fuzz/corpus/
+tests/fuzz/artifacts/
 
 # Flutter 构建产物（flutter_dashboard/.gitignore 也会覆盖一部分）
 flutter_dashboard/build/
@@ -32,3 +32,6 @@ flutter_dashboard/*.iml
 # 内部评审文件与答辩材料（不入库）
 /fufter
 /data/
+
+/tests/bench/
+/rm.sh

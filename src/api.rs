@@ -1,11 +1,12 @@
 //! 管理 API + WebSocket 实时告警推送（供 Flutter 面板消费）。
 //!
 //! 端点：
-//!   GET  /api/stats       —— 统计（总请求 / 拦截数 / QPS）
-//!   GET  /api/alerts      —— 最近 100 条告警
-//!   GET  /api/blocked     —— 封禁 IP 列表（预留，当前为空实现）
-//!   POST /api/block       —— 手动封禁 IP（预留，当前为空实现）
-//!   WS   /ws/alerts       —— 实时告警流
+//!   GET     /api/stats       —— 统计（总请求 / 拦截数 / QPS）
+//!   GET     /api/alerts      —— 最近 100 条告警
+//!   GET     /api/blocked     —— 当前封禁 IP 列表
+//!   POST    /api/block       —— 手动封禁 IP（JSON: `{"ip":"1.2.3.4","duration_secs":300}`）
+//!   DELETE  `/api/block/{ip}`  —— 手动解封 IP
+//!   WS      /ws/alerts       —— 实时告警流
 //!
 //! 鉴权：所有端点要求 `Authorization: Bearer <token>`，
 //! token 由启动时环境变量 `RUSTGATE_API_TOKEN` 指定（或 settings 文件提供）。
@@ -18,34 +19,44 @@
 //!   因此 WS 必须走 TLS 反代，否则 token 会出现在 URL 里被日志/历史记录。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
+use hyper::StatusCode;
+use serde::Deserialize;
 use tokio::sync::broadcast;
 
+use crate::block::BlockList;
 use crate::bus::AlertBus;
 
-/// 管理 API 共享状态：告警总线 + 鉴权 token。
+/// 管理 API 共享状态：告警总线 + 鉴权 token + 封禁黑名单。
 #[derive(Clone)]
 pub struct AppState {
     pub bus: Arc<AlertBus>,
     pub token: String,
+    pub block_list: Arc<BlockList>,
 }
 
-pub fn router(bus: Arc<AlertBus>, token: String) -> Router {
-    let state = AppState { bus, token };
+pub fn router(bus: Arc<AlertBus>, token: String, block_list: Arc<BlockList>) -> Router {
+    let state = AppState {
+        bus,
+        token,
+        block_list,
+    };
     Router::new()
         .route("/", get(index))
         .route("/api/stats", get(stats))
         .route("/api/alerts", get(alerts))
         .route("/api/blocked", get(blocked))
         .route("/api/block", post(block))
+        .route("/api/block/{ip}", delete(unblock))
         .route("/ws/alerts", get(ws_alerts))
         // 全部路由走鉴权中间件
         .layer(from_fn_with_state(state.clone(), auth_middleware))
@@ -54,7 +65,32 @@ pub fn router(bus: Arc<AlertBus>, token: String) -> Router {
 
 /// 内置 Web 仪表盘（单文件 HTML+JS，打开即用）。
 async fn index() -> impl IntoResponse {
-    axum::response::Html(INDEX_HTML)
+    // S3：给页面加安全响应头，防点击劫持（封禁/解封按钮）、MIME 嗅探与信息泄漏。
+    // 页面使用内联 <style>/<script> 并 fetch/WS 连接任意 base，故 CSP 需放行 unsafe-inline
+    // 与任意 http(s)/ws(s) 目标；`frame-ancestors 'none'` 禁止被嵌入（防点击劫持）。
+    let mut resp = axum::response::Html(INDEX_HTML).into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        "x-frame-options",
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "referrer-policy",
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        "content-security-policy",
+        axum::http::HeaderValue::from_static(
+            "default-src 'none'; script-src 'unsafe-inline'; \
+             style-src 'unsafe-inline'; connect-src http: https: ws: wss:; \
+             frame-ancestors 'none'",
+        ),
+    );
+    resp
 }
 
 /// Bearer token 鉴权中间件：校验失败返回 401。
@@ -64,44 +100,59 @@ async fn index() -> impl IntoResponse {
 ///   （部分 WS 客户端无法自定义握手 header），减少 token 进 URL/日志的面。
 /// * token 比较使用恒定时间比较，降低时序侧信道风险。
 async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    // Web 仪表盘页面本身公开；其调用的 API 仍需 token
+    const MAX_TOKEN_LEN: usize = 4096;
+    // 仪表盘页面公开
     if req.uri().path() == "/" {
         return next.run(req).await;
     }
+
     let is_ws = req.uri().path() == "/ws/alerts";
 
-    let from_header = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    let from_query = if is_ws {
+    let token_from = if is_ws {
+        // WebSocket: 从 Query 取 &str（注意：没有调用 to_string()！）
         req.uri().query().and_then(|q| {
             q.split('&').find_map(|kv| {
                 let (k, v) = kv.split_once('=')?;
-                (k == "token").then(|| v.to_string())
+                (k == "token").then_some(v) // 直接返回 &str，零分配！
             })
         })
     } else {
-        None
+        // REST API: 从 Header 取 &str
+        req.headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
     };
 
-    let authorized = from_header
-        .is_some_and(|t| constant_time_eq(t.as_bytes(), state.token.as_bytes()))
-        || from_query
-            .as_deref()
-            .is_some_and(|t| constant_time_eq(t.as_bytes(), state.token.as_bytes()));
-
-    if authorized {
-        next.run(req).await
-    } else {
-        (
-            axum::http::StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "unauthorized" })),
-        )
-            .into_response()
+    // 先检查是否存在，再检查长度（此时 token 还是切片，没发生复制）
+    match token_from {
+        Some(token) if token.len() <= MAX_TOKEN_LEN => {
+            // 长度合法，进行恒定时间比较
+            if constant_time_eq(token.as_bytes(), state.token.as_bytes()) {
+                next.run(req).await
+            } else {
+                unauthorized()
+            }
+        }
+        Some(_) => {
+            // 长度超限，直接拒绝（此时 token 是切片，内存安全）
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "Token too large (max 4096 bytes)" })),
+            )
+                .into_response()
+        }
+        None => unauthorized(),
     }
+}
+
+/// 辅助函数：返回 401 Unauthorized 响应
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "error": "unauthorized" })),
+    )
+        .into_response()
 }
 
 /// 恒定时间比较两个字节串（长度不等时直接返回 false，不暴露长度差时序）。
@@ -117,19 +168,94 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 async fn stats(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.bus.stats().await)
+    Json(state.bus.stats())
 }
 
 async fn alerts(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.bus.recent_alerts(100).await)
+    Json(state.bus.recent_alerts(100))
 }
 
-async fn blocked() -> impl IntoResponse {
-    Json(Vec::<String>::new())
+/// GET /api/blocked：返回当前生效的封禁 IP 列表（已自动过滤过期项）。
+async fn blocked(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.block_list.list())
 }
 
-async fn block() -> impl IntoResponse {
-    Json(serde_json::json!({ "ok": true, "note": "预留接口" }))
+/// POST /api/block 请求体：`ip` 必填，`duration_secs` 默认 300 秒。
+#[derive(Debug, Deserialize)]
+struct BlockRequest {
+    ip: String,
+    #[serde(default = "default_block_secs")]
+    duration_secs: u64,
+}
+
+/// 封禁默认时长：300 秒（5 分钟）。
+fn default_block_secs() -> u64 {
+    300
+}
+
+/// 封禁时长上限：7 天。防止恶意传入超大 `duration_secs`
+/// （如 `u64::MAX`）触发 `Instant` 溢出 panic（`BlockList::block` 内部也有 `checked_add` 兜底）。
+const MAX_BLOCK_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// IPv6 文本形式最长 45 字符（含 `[ ]`），超长的一律拒绝，避免无谓解析。
+const MAX_IP_LEN: usize = 45;
+
+/// POST /api/block：手动封禁一个 IP，返回封禁记录；IP 非法返回 400。
+async fn block(State(state): State<AppState>, Json(req): Json<BlockRequest>) -> impl IntoResponse {
+    // 输入校验：时长必须在 1~MAX_BLOCK_SECS 之间，IP 长度不能超限。
+    // axum 的 Json 提取器默认还有 2MB 请求体上限，超大请求体会先被 413 拒绝，不会进到这里。
+    if req.duration_secs == 0 || req.duration_secs > MAX_BLOCK_SECS {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("duration_secs 必须在 1~{MAX_BLOCK_SECS} 之间")
+            })),
+        )
+            .into_response();
+    }
+    if req.ip.len() > MAX_IP_LEN {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "IP 长度非法" })),
+        )
+            .into_response();
+    }
+
+    let duration = Duration::from_secs(req.duration_secs);
+    match state.block_list.block(&req.ip, duration) {
+        Ok(entry) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "blocked": entry })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/block/{ip}：手动解封一个 IP。
+///
+/// * 成功移除 → 200 `{"ok":true}`；
+/// * 该 IP 本就不在封禁列表 → 404；
+/// * IP 格式非法 → 400。
+async fn unblock(State(state): State<AppState>, Path(ip): Path<String>) -> impl IntoResponse {
+    match state.block_list.unblock(&ip) {
+        Ok(true) => Json(serde_json::json!({ "ok": true, "unblocked": ip })).into_response(),
+        Ok(false) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "IP 不在封禁列表" })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 /// WebSocket：实时推送拦截告警。
@@ -226,6 +352,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   .settings .box { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; width:min(420px,90vw); }
   .settings label { display:block; font-size:13px; color:var(--sub); margin:10px 0 4px; }
   .settings input { width:100%; background:#0b0e13; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:9px 12px; font-size:14px; }
+  .form-row { display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; align-items:center; }
+  .form-row input { background:#0b0e13; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:9px 12px; font-size:14px; flex:1; min-width:160px; }
+  .form-row .hint { color:var(--sub); font-size:12px; }
 </style>
 </head>
 <body>
@@ -246,10 +375,21 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     <div class="tab active" onclick="tab(0)">实时告警</div>
     <div class="tab" onclick="tab(1)">攻击类型</div>
     <div class="tab" onclick="tab(2)">来源 IP</div>
+    <div class="tab" onclick="tab(3)">封禁管理</div>
   </div>
   <div class="panel active" id="p0"><ul id="alerts"><li style="color:var(--sub)">暂无告警 —— 尝试发一个恶意请求</li></ul></div>
   <div class="panel" id="p1"><div id="cats" style="color:var(--sub)">暂无数据</div></div>
   <div class="panel" id="p2"><div id="ips" style="color:var(--sub)">暂无数据</div></div>
+  <div class="panel" id="p3">
+    <div class="form-row">
+      <input id="bip" placeholder="要封禁的 IP，如 1.2.3.4" maxlength="45">
+      <input id="bsecs" type="number" value="300" min="1" max="604800" title="封禁时长（秒），最多 7 天">
+      <span class="hint">秒（最多 604800）</span>
+      <button onclick="doBlock()">🔒 封禁</button>
+      <button onclick="refreshBlocked()">🔄 刷新列表</button>
+    </div>
+    <div id="blocked-list" style="color:var(--sub)">当前没有封禁的 IP</div>
+  </div>
 </main>
 
 <div class="settings" id="settings">
@@ -271,29 +411,50 @@ let token = localStorage.getItem('rg_token') || 'dev-token-change-me';
 let base = localStorage.getItem('rg_base') || location.origin;
 let alerts = [];
 let ws = null;
+let fatalErr = false;   // 已显示 URI/token 错误时，轮询与 WS 不再覆盖红框
 
 function api(path) {
   return fetch(base + path, { headers: { 'Authorization': 'Bearer ' + token } });
 }
+function apiJson(path, method, body) {
+  return fetch(base + path, {
+    method: method || 'GET',
+    headers: Object.assign({ 'Authorization': 'Bearer ' + token }, body ? { 'Content-Type': 'application/json' } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
 function showErr(msg) { const e = document.getElementById('err'); if (msg) { e.style.display='block'; e.textContent = msg; } else { e.style.display='none'; } }
+function showFatal(msg) { fatalErr = true; showErr(msg); }
+function clearErr() { fatalErr = false; showErr(null); }
 function fmtTime(t) { return new Date(t*1000).toLocaleTimeString('zh-CN', { hour12:false }); }
+// HTML 转义：所有服务端数据（尤其攻击者可控的 path/category/ip）插入 innerHTML
+// 前必须转义，防止存储型 XSS（token 存在 localStorage，一旦 XSS 即凭证失窃）。
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 async function refreshStats() {
+  if (fatalErr) return; // 红框已显示 URI/token 错误，轮询不再覆盖它
   try {
     const r = await api('/api/stats');
-    if (!r.ok) throw new Error('HTTP ' + r.status + (r.status===401 ? '（token 不正确？）' : ''));
+    if (r.status === 401) { showFatal('可能是 token 错误：管理 API 返回 401，请点击 ⚙ 连接设置 修改 token'); return; }
+    if (!r.ok) { showFatal('管理 API 错误：HTTP ' + r.status); return; }
     const s = await r.json();
     document.getElementById('total').textContent = s.total_requests ?? 0;
     document.getElementById('blocked').textContent = s.blocked ?? 0;
     document.getElementById('rate').textContent = s.total_requests > 0 ? (s.blocked*100/s.total_requests).toFixed(1)+'%' : '--';
     document.getElementById('qps').textContent = (s.qps ?? 0).toFixed(1);
     showErr(null);
-  } catch(e) { showErr('统计拉取失败: ' + e.message); }
+  } catch(e) {
+    showFatal('URI 错误：无法连接管理 API 地址 ' + base + '，请点击 ⚙ 连接设置 修改地址');
+  }
 }
 
 async function refreshAlerts() {
+  if (fatalErr) return;
   try {
     const r = await api('/api/alerts');
+    if (r.status === 401) { showFatal('可能是 token 错误：管理 API 返回 401，请点击 ⚙ 连接设置 修改 token'); return; }
     if (!r.ok) return;
     const list = await r.json();
     alerts = list.slice().reverse(); // 服务端倒序返回，正过来
@@ -307,8 +468,8 @@ function renderAlerts() {
   ul.innerHTML = alerts.slice(0,200).map(a => {
     const extra = a.hits && a.hits.length > 1 ? ' +' + (a.hits.length-1) + ' 条规则' : '';
     const cnt = a.count > 1 ? ' ×' + a.count : '';
-    return `<li class="alert"><b>[${a.category}]</b> ${a.method} ${a.path}${cnt}
-      <div class="meta">${a.ip} · ${a.detail} · score=${a.score}${extra} · ${fmtTime(a.time)}</div></li>`;
+    return `<li class="alert"><b>[${esc(a.category)}]</b> ${esc(a.method)} ${esc(a.path)}${cnt}
+      <div class="meta">${esc(a.ip)} · ${esc(a.detail)} · score=${a.score}${extra} · ${fmtTime(a.time)}</div></li>`;
   }).join('');
 }
 
@@ -318,7 +479,7 @@ function renderCats() {
   const entries = Object.entries(m).sort((x,y)=>y[1]-x[1]);
   const max = entries.length ? entries[0][1] : 1;
   document.getElementById('cats').innerHTML = entries.length
-    ? entries.map(([k,v]) => `<div class="bar-row"><span style="width:120px">${k}</span>
+    ? entries.map(([k,v]) => `<div class="bar-row"><span style="width:120px">${esc(k)}</span>
         <div class="bar" style="width:${Math.max(2, v/max*300)}px"></div><span>${v}</span></div>`).join('')
     : '暂无数据';
 }
@@ -328,11 +489,58 @@ function renderIps() {
   alerts.forEach(a => m[a.ip] = (m[a.ip]||0) + (a.count||1));
   const entries = Object.entries(m).sort((x,y)=>y[1]-x[1]).slice(0,20);
   document.getElementById('ips').innerHTML = entries.length
-    ? `<table><tr><th>IP</th><th>告警次数</th></tr>${entries.map(([ip,c]) => `<tr><td>${ip}</td><td>${c}</td></tr>`).join('')}</table>`
+    ? `<table><tr><th>IP</th><th>告警次数</th></tr>${entries.map(([ip,c]) => `<tr><td>${esc(ip)}</td><td>${c}</td></tr>`).join('')}</table>`
     : '暂无数据';
 }
 
+async function refreshBlocked() {
+  if (fatalErr) return;
+  try {
+    const r = await api('/api/blocked');
+    if (r.status === 401) { showFatal('可能是 token 错误：管理 API 返回 401，请点击 ⚙ 连接设置 修改 token'); return; }
+    if (!r.ok) return;
+    const list = await r.json();
+    const el = document.getElementById('blocked-list');
+    if (!list.length) { el.innerHTML = '<div style="color:var(--sub)">当前没有封禁的 IP</div>'; return; }
+    el.innerHTML = '<table><tr><th>IP</th><th>解封时间</th><th></th></tr>' + list.map(b =>
+      `<tr><td>${esc(b.ip)}</td><td>${fmtTime(b.expires_at)}</td>` +
+      `<td><button onclick="doUnblock('${b.ip}')">解封</button></td></tr>`
+    ).join('') + '</table>';
+  } catch(_) {}
+}
+
+async function doBlock() {
+  const ip = document.getElementById('bip').value.trim();
+  let secs = parseInt(document.getElementById('bsecs').value || '300', 10) || 300;
+  secs = Math.max(1, Math.min(secs, 604800)); // 前端兜底：1 ~ 7 天
+  if (!ip) { showErr('请输入要封禁的 IP'); return; }
+  if (ip.length > 45) { showErr('IP 长度非法'); return; }
+  const r = await apiJson('/api/block', 'POST', { ip: ip, duration_secs: secs });
+  if (r.status === 401) { showFatal('可能是 token 错误：管理 API 返回 401，请点击 ⚙ 连接设置 修改 token'); return; }
+  const j = await r.json().catch(()=>({}));
+  if (r.ok) {
+    showErr(null);
+    document.getElementById('bip').value = '';
+    refreshBlocked();
+  } else {
+    showErr(j.error ? '封禁失败：' + j.error : ('封禁失败：HTTP ' + r.status));
+  }
+}
+
+async function doUnblock(ip) {
+  const r = await apiJson('/api/block/' + encodeURIComponent(ip), 'DELETE');
+  if (r.status === 401) { showFatal('可能是 token 错误：管理 API 返回 401，请点击 ⚙ 连接设置 修改 token'); return; }
+  const j = await r.json().catch(()=>({}));
+  if (r.ok) {
+    showErr(null);
+    refreshBlocked();
+  } else {
+    showErr(j.error ? '解封失败：' + j.error : ('解封失败：HTTP ' + r.status));
+  }
+}
+
 function connectWs() {
+  if (fatalErr) return; // 红框已显示 URI/token 错误，不再尝试重连与覆盖
   if (ws) { ws.close(); }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = base.replace(/^http/, 'ws') + '/ws/alerts?token=' + encodeURIComponent(token);
@@ -346,9 +554,9 @@ function connectWs() {
       renderAlerts(); renderCats(); renderIps();
     } catch(_) {}
   };
-  ws.onerror = () => showErr('WebSocket 连接失败（检查 token 与地址）');
-  ws.onopen = () => showErr(null);
-  ws.onclose = () => showErr('WebSocket 已断开，3 秒后重连…');
+  ws.onerror = () => {}; // 错误统一由 REST 轮询在红框报告，避免消息来回跳
+  ws.onopen = () => {};
+  ws.onclose = () => {}; // 静默重连由下方定时器负责
 }
 
 function tab(i) {
@@ -368,15 +576,16 @@ function saveSettings() {
   localStorage.setItem('rg_base', base);
   closeSettings();
   alerts = [];
+  clearErr();   // 重新用新 token/地址尝试，清除旧的 URI/token 错误
   refreshAll();
   connectWs();
 }
-function refreshAll() { refreshStats(); refreshAlerts(); }
+function refreshAll() { refreshStats(); refreshAlerts(); refreshBlocked(); }
 
 refreshAll();
 connectWs();
 setInterval(refreshStats, 2000);
-setInterval(() => { if (!ws || ws.readyState > 1) connectWs(); }, 3000);
+setInterval(() => { if (!fatalErr && (!ws || ws.readyState > 1)) connectWs(); }, 3000);
 </script>
 </body>
 </html>

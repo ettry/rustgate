@@ -1,0 +1,49 @@
+[Unit]
+Description=RustGate Web Application Firewall
+Documentation=https://github.com/ettry/rustgate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustgate
+Group=rustgate
+ExecStart=/usr/local/bin/rustgate waf
+Restart=on-failure
+RestartSec=2s
+
+# 配置目录（settings 与 rules.toml）
+Environment=RUSTGATE_CONFIG_DIR=/var/lib/rustgate
+Environment=RUST_LOG=rustgate=info
+
+# 80/443端口支持
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# 必填项也可以通过 settings 文件提供；环境变量优先级更高。
+# Environment=RUSTGATE_BACKEND=http://127.0.0.1:8080
+# Environment=RUSTGATE_API_TOKEN=change-me
+# Environment=RUSTGATE_API=127.0.0.1:9001
+# Environment=RUSTGATE_LISTEN=127.0.0.1:9000
+
+# 可选：前端 HTTPS（证书/私钥需 rustgate 用户可读）
+# Environment=RUSTGATE_TLS_CERT=/etc/rustgate/certs/fullchain.pem
+# Environment=RUSTGATE_TLS_KEY=/etc/rustgate/certs/privkey.pem
+
+# 可选：可信反向代理列表（逗号分隔，支持 CIDR）。只有这些来源的 X-Forwarded-For 才被采信。
+# Environment=RUSTGATE_TRUSTED_PROXIES=127.0.0.1,::1,192.168.10.0/24
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rustgate
+PrivateTmp=true
+
+# 若需要以 rustgate 用户直接绑定 80/443（<1024 端口），取消下面两行注释。
+# 高端口（如 19191/19193）不需要此能力。
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

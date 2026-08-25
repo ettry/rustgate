@@ -28,6 +28,8 @@ pub struct Engine {
     rules: Vec<Rule>,
     /// 是否存在 field = "Body" 的规则；没有则请求体可零拷贝透传。
     needs_body: bool,
+    /// 是否存在 field = "Header" 的规则；没有则构建归一化请求时跳过 header 拼接（省分配）。
+    needs_headers: bool,
 }
 
 /// 标准化后的请求，供匹配器逐字段检查。
@@ -62,11 +64,26 @@ pub enum Verdict {
 }
 
 impl NormalizedRequest {
+    /// 完整构建（含 header 拼接），供测试/Fuzz 等直接使用。
     pub fn from_parts(
         method: &hyper::Method,
         uri: &hyper::Uri,
         headers: &hyper::HeaderMap,
         body: &str,
+    ) -> Self {
+        Self::build(method, uri, headers, body, true)
+    }
+
+    /// 按需构建：`include_headers = false` 时跳过 header 拼接与 `header_values`。
+    ///
+    /// 热路径由 [`Engine::normalize`] 调用，按引擎是否含 `Header` 规则决定，
+    /// 避免无 `Header` 规则时为每个请求做字符串拼接与 `HashMap` 分配（P4 优化）。
+    fn build(
+        method: &hyper::Method,
+        uri: &hyper::Uri,
+        headers: &hyper::HeaderMap,
+        body: &str,
+        include_headers: bool,
     ) -> Self {
         let path_query = uri
             .path_and_query()
@@ -82,21 +99,23 @@ impl NormalizedRequest {
 
         let mut header_flat = String::new();
         let mut header_values: HashMap<String, String> = HashMap::new();
-        for (k, v) in headers {
-            header_flat.push_str(k.as_str());
-            header_flat.push('=');
-            let value = String::from_utf8_lossy(v.as_bytes());
-            header_flat.push_str(&value);
-            header_flat.push(' ');
+        if include_headers {
+            for (k, v) in headers {
+                header_flat.push_str(k.as_str());
+                header_flat.push('=');
+                let value = String::from_utf8_lossy(v.as_bytes());
+                header_flat.push_str(&value);
+                header_flat.push(' ');
 
-            let name = k.as_str().to_ascii_lowercase();
-            header_values
-                .entry(name)
-                .and_modify(|old| {
-                    old.push_str(", ");
-                    old.push_str(&value);
-                })
-                .or_insert_with(|| value.into_owned());
+                let name = k.as_str().to_ascii_lowercase();
+                header_values
+                    .entry(name)
+                    .and_modify(|old| {
+                        old.push_str(", ");
+                        old.push_str(&value);
+                    })
+                    .or_insert_with(|| value.into_owned());
+            }
         }
         NormalizedRequest {
             method: method.to_string(),
@@ -240,6 +259,7 @@ impl Engine {
     pub fn new(cfg: Config) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut regexes = Vec::new();
         let needs_body = cfg.rules.iter().any(|r| r.field == RuleField::Body);
+        let needs_headers = cfg.rules.iter().any(|r| r.field == RuleField::Header);
 
         // 字面量规则按 (field, header) 分组，每组一个多模式自动机，
         // 一次扫描即可匹配组内所有模式；且 ASCII 大小写不敏感。
@@ -286,6 +306,7 @@ impl Engine {
             literals,
             regexes,
             needs_body,
+            needs_headers,
             rules: cfg.rules,
         })
     }
@@ -294,6 +315,26 @@ impl Engine {
     #[must_use]
     pub fn needs_body(&self) -> bool {
         self.needs_body
+    }
+
+    /// 是否存在需要检查 header 的规则；没有时归一化可跳过 header 拼接（省分配）。
+    #[must_use]
+    pub fn needs_headers(&self) -> bool {
+        self.needs_headers
+    }
+
+    /// 按本引擎的规则需要构建归一化请求。
+    ///
+    /// 无 `Header` 规则时跳过 header 拼接与 `header_values` 构建（P4 优化），
+    /// 避免热路径上为每个请求做无谓的字符串拼接与 `HashMap` 分配。
+    pub fn normalize(
+        &self,
+        method: &hyper::Method,
+        uri: &hyper::Uri,
+        headers: &hyper::HeaderMap,
+        body: &str,
+    ) -> NormalizedRequest {
+        NormalizedRequest::build(method, uri, headers, body, self.needs_headers)
     }
 
     // 可疑字节本身计分：正常请求不应出现 NUL/控制字节，
@@ -488,6 +529,132 @@ mod tests {
             "",
         );
         assert!(matches!(engine.inspect(&req), Verdict::Block { score, .. } if score >= 20));
+    }
+
+    #[test]
+    fn needs_headers_reflects_header_rules() {
+        // 无 Header 规则 → 不需要构建 header
+        let no_header = Engine::new(test_config(vec![])).unwrap();
+        assert!(!no_header.needs_headers());
+
+        // 有 Header 规则 → 需要构建 header
+        let cfg = test_config(vec![Rule {
+            id: 100,
+            name: "bad ua".into(),
+            category: "scanner".into(),
+            field: RuleField::Header,
+            header: Some("User-Agent".into()),
+            pattern: "badagent".into(),
+            score: 25,
+        }]);
+        let with_header = Engine::new(cfg).unwrap();
+        assert!(with_header.needs_headers());
+    }
+
+    #[test]
+    fn normalize_skips_header_build_when_not_needed() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("user-agent", "badagent/1.0".parse().unwrap());
+        headers.insert("cookie", "session=abc".parse().unwrap());
+
+        // 无 Header 规则：normalize 应跳过 header 拼接（性能优化生效）
+        let engine = Engine::new(test_config(vec![])).unwrap();
+        let req = engine.normalize(&hyper::Method::GET, &"/x".parse().unwrap(), &headers, "");
+        assert!(req.headers.is_empty(), "无 Header 规则时不应拼接 header");
+        assert!(
+            req.header_values.is_empty(),
+            "无 Header 规则时不应构建 header_values"
+        );
+
+        // 有 Header 规则：必须完整构建，且 Header 规则能命中
+        let cfg = test_config(vec![Rule {
+            id: 100,
+            name: "bad ua".into(),
+            category: "scanner".into(),
+            field: RuleField::Header,
+            header: Some("User-Agent".into()),
+            pattern: "badagent".into(),
+            score: 25,
+        }]);
+        let engine = Engine::new(cfg).unwrap();
+        let req = engine.normalize(&hyper::Method::GET, &"/x".parse().unwrap(), &headers, "");
+        assert!(!req.headers.is_empty(), "有 Header 规则时必须拼接 header");
+        assert_eq!(req.header_values.get("user-agent").unwrap(), "badagent/1.0");
+        assert!(matches!(engine.inspect(&req), Verdict::Block { .. }));
+    }
+
+    #[test]
+    fn percent_decode_handles_hex_and_invalid_sequences() {
+        // 合法 hex：大小写都行，%41 → 'A'；%6a 小写 hex → 'j'（%af 解码后非 UTF-8 不测）
+        let (s, suspicious) = decode_and_normalize("%41%42%2f%6a%6A");
+        assert_eq!(s, "AB/jj");
+        assert_eq!(suspicious, 0);
+
+        // 控制字节：CR 温和（替换不计分）、NUL 危险（替换 +1 分）
+        let (s, suspicious) = decode_and_normalize("%0d%09");
+        assert_eq!(s, "  ");
+        assert_eq!(suspicious, 0, "CR/tab 属温和控制字节，不应计可疑分");
+
+        let (s, suspicious) = decode_and_normalize("%00");
+        assert_eq!(s, " ");
+        assert_eq!(suspicious, 1, "NUL 属危险控制字节，应计可疑分");
+
+        // 非法/不完整百分号序列：原样保留
+        assert_eq!(decode_and_normalize("a%").0, "a%");
+        assert_eq!(decode_and_normalize("%G1").0, "%G1");
+        assert_eq!(decode_and_normalize("a%2").0, "a%2");
+    }
+
+    #[test]
+    fn raw_control_byte_counts_as_suspicious() {
+        // 直接出现的原始 NUL 字节（非 %00 编码）也应归一化并计可疑分
+        // （覆盖 decode_and_normalize 中「未编码危险控制字节」分支）
+        let (s, suspicious) = decode_and_normalize("a\u{0}b\u{0}c");
+        assert_eq!(s, "a b c");
+        assert_eq!(suspicious, 2);
+    }
+
+    #[test]
+    fn suspicious_bytes_alone_can_block_with_suspicious_category() {
+        // 4 个 NUL → 4×5 = 20 >= 阈值 → 无规则命中时归为 suspicious
+        let engine = Engine::new(test_config(vec![])).unwrap();
+        let req = NormalizedRequest::from_parts(
+            &hyper::Method::GET,
+            &"/?q=%00%00%00%00".parse().unwrap(),
+            &hyper::HeaderMap::new(),
+            "",
+        );
+        match engine.inspect(&req) {
+            Verdict::Block { hits, score } => {
+                // NUL 同时出现在 url 与 args 字段，可疑分至少 4×5=20
+                assert!(score >= 20, "score 应 >=20，实际 {score}");
+                assert_eq!(hits[0].category, "suspicious");
+            }
+            Verdict::Allow => panic!("4 个 NUL 应触发可疑分拦截"),
+        }
+    }
+
+    #[test]
+    fn header_specific_rule_with_missing_header_is_allow() {
+        // 规则指定 header="User-Agent"，但请求没有该 header → field_value 返回空 → 放行
+        let cfg = test_config(vec![Rule {
+            id: 100,
+            name: "bad ua".into(),
+            category: "scanner".into(),
+            field: RuleField::Header,
+            header: Some("User-Agent".into()),
+            pattern: "badagent".into(),
+            score: 25,
+        }]);
+        let engine = Engine::new(cfg).unwrap();
+        // 请求只有 cookie，没有 user-agent
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("cookie", "session=abc".parse().unwrap());
+        let req = engine.normalize(&hyper::Method::GET, &"/x".parse().unwrap(), &headers, "");
+        assert!(
+            matches!(engine.inspect(&req), Verdict::Allow),
+            "缺 header 时应放行"
+        );
     }
 }
 

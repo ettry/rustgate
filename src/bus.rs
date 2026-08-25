@@ -3,17 +3,25 @@
 //! 用 `tokio::sync::broadcast` 实现一对多推送；
 //! 另维护一个带锁的历史缓冲，供管理 API 读取最近告警与统计。
 //! 统计中的 QPS 用滑动窗口计算（最近 1 秒内的放行请求数）。
+//!
+//! 性能设计（`count_request` 在热路径上每请求调用一次）：
+//! * `total_requests` / `blocked` 用 `AtomicU64` 无锁累加；
+//! * 历史/去重/QPS 窗口用 `std::sync::Mutex`（临界区内无 await，比异步锁快），
+//!   因此 `count_request`/`publish`/`stats`/`recent_alerts` 都是同步方法；
+//! * QPS 窗口每次 push 后立即修剪过期项（均摊 O(1)：每条最多被 pop 一次），
+//!   内存稳定在「1 秒样本量」，不会像旧版那样堆积到上百万条再修剪。
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
 /// QPS 滑动窗口时长。
 const QPS_WINDOW: Duration = Duration::from_secs(1);
-/// 窗口内最多保留的时间戳数量（防极端 QPS 下队列膨胀）。
-const MAX_WINDOW_SAMPLES: usize = 1_000_000;
+/// 历史告警环形保留上限。
+const MAX_ALERTS: usize = 500;
 
 /// 单条命中规则（告警里携带全部命中，hits[0] 为第一条）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -86,21 +94,26 @@ impl Alert {
         )
     }
 
-    /// 把告警转成 HTTP 响应（用于反代直接返回拦截页 / JSON）。
+    /// 对外返回的通用拦截响应。
     ///
-    /// 构建响应在合法输入下不会失败；极端情况兜底为最简 500 响应，不 panic。
-    pub fn into_response(
-        self,
+    /// 响应体是**固定的通用拦截页**：不回显 `rule_id`/`score`/`hits`/请求路径等细节，
+    /// 防止攻击者据此探测规则阈值、精确构造低于阈值的绕过载荷（WAF 指纹）。
+    /// 详细命中信息只通过管理 API（`/api/alerts`）与审计日志提供给运维方。
+    ///
+    /// 构建响应在合法输入下不会失败；极端情况兜底为最简响应，不 panic。
+    #[must_use]
+    pub fn block_response(
         code: hyper::StatusCode,
     ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
-        let body = serde_json::to_string(&self).unwrap_or_else(|_| "{\"action\":\"block\"}".into());
         hyper::Response::builder()
             .status(code)
             .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+            .body(http_body_util::Full::new(bytes::Bytes::from_static(
+                b"{\"action\":\"block\"}",
+            )))
             .unwrap_or_else(|_| {
-                hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(
-                    "{\"action\":\"block\"}",
+                hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from_static(
+                    b"{\"action\":\"block\"}",
                 )))
             })
     }
@@ -116,11 +129,9 @@ pub struct Stats {
 
 #[derive(Debug, Default)]
 struct Inner {
-    /// 最近告警（环形保留，上限 500；VecDeque 两端 O(1)）
-    alerts: std::collections::VecDeque<Alert>,
-    total_requests: u64,
-    blocked: u64,
-    /// 放行请求时间戳（QPS 滑动窗口）
+    /// 最近告警（环形保留，上限 [`MAX_ALERTS`]；`VecDeque` 两端 O(1)）
+    alerts: VecDeque<Alert>,
+    /// 放行请求时间戳（QPS 滑动窗口；每次 push 后即时修剪）
     request_times: VecDeque<Instant>,
     /// 上一条已落盘/已展示告警的去重键（用于日志瘦身）
     last_dedup_key: Option<String>,
@@ -129,6 +140,10 @@ struct Inner {
 #[derive(Clone)]
 pub struct AlertBus {
     tx: broadcast::Sender<Alert>,
+    /// 总请求数：热路径每请求 +1，原子操作无锁。
+    total_requests: Arc<AtomicU64>,
+    /// 拦截总数：每次 publish +1，原子操作无锁。
+    blocked: Arc<AtomicU64>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -138,6 +153,8 @@ impl AlertBus {
         let (tx, _) = broadcast::channel(512);
         AlertBus {
             tx,
+            total_requests: Arc::new(AtomicU64::new(0)),
+            blocked: Arc::new(AtomicU64::new(0)),
             inner: Arc::new(Mutex::new(Inner::default())),
         }
     }
@@ -147,11 +164,12 @@ impl AlertBus {
     /// * 若与上一条告警的去重键相同（除时间外同一攻击），则只把上一条的
     ///   `count` +1，不写新条目、不广播，返回 `false`（调用方无需落盘）；
     /// * 否则写入历史、广播给订阅者、更新去重键，返回 `true`（调用方应落盘）。
-    pub async fn publish(&self, alert: Alert) -> bool {
+    #[must_use]
+    pub fn publish(&self, alert: Alert) -> bool {
+        self.blocked.fetch_add(1, Ordering::Relaxed);
         let dedup_key = alert.dedup_key();
         {
-            let mut inner = self.inner.lock().await;
-            inner.blocked += 1;
+            let mut inner = self.lock();
             if inner.last_dedup_key.as_deref() == Some(dedup_key.as_str()) {
                 // 连续重复：真实次数累加到最后一条（即上一条相同告警）
                 if let Some(last) = inner.alerts.back_mut() {
@@ -161,7 +179,7 @@ impl AlertBus {
             }
             inner.last_dedup_key = Some(dedup_key);
             inner.alerts.push_back(alert.clone());
-            if inner.alerts.len() > 500 {
+            if inner.alerts.len() > MAX_ALERTS {
                 inner.alerts.pop_front();
             }
         }
@@ -171,17 +189,17 @@ impl AlertBus {
     }
 
     /// 记录一次放行请求（累计总数 + 滑动窗口计数）。
-    pub async fn count_request(&self) {
-        let mut inner = self.inner.lock().await;
-        inner.total_requests += 1;
+    ///
+    /// 窗口每次 push 后立即修剪 1 秒外的旧时间戳：均摊 O(1)
+    /// （每条时间戳最多入队/出队各一次），内存恒定在 1 秒样本量。
+    pub fn count_request(&self) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
+        let cutoff = now.checked_sub(QPS_WINDOW).unwrap_or(now);
+        let mut inner = self.lock();
         inner.request_times.push_back(now);
-        // 懒惰清理：只在队列过长时修剪窗口外的旧时间戳
-        if inner.request_times.len() > MAX_WINDOW_SAMPLES {
-            let cutoff = now.checked_sub(QPS_WINDOW).unwrap_or(now);
-            while inner.request_times.front().is_some_and(|t| *t < cutoff) {
-                inner.request_times.pop_front();
-            }
+        while inner.request_times.front().is_some_and(|t| *t < cutoff) {
+            inner.request_times.pop_front();
         }
     }
 
@@ -192,27 +210,34 @@ impl AlertBus {
     }
 
     /// 读取统计快照。QPS = 最近 1 秒内的请求数（滑动窗口，取整）。
-    pub async fn stats(&self) -> Stats {
+    #[must_use]
+    pub fn stats(&self) -> Stats {
         let now = Instant::now();
         let cutoff = now.checked_sub(QPS_WINDOW).unwrap_or(now);
-        let mut inner = self.inner.lock().await;
+        let inner = self.lock();
         // 修剪窗口，保证 QPS 精确反映最近一秒
-        while inner.request_times.front().is_some_and(|t| *t < cutoff) {
-            inner.request_times.pop_front();
-        }
-        #[allow(clippy::cast_precision_loss)] // 窗口样本数 ≤ 1e6，f64 完全精确
-        let qps = inner.request_times.len() as f64;
+        //（count_request 已即时修剪，这里兜底应对长时间无人请求后的一次查询）
+        let qps = inner.request_times.iter().filter(|t| **t >= cutoff).count();
         Stats {
-            total_requests: inner.total_requests,
-            blocked: inner.blocked,
-            qps,
+            total_requests: self.total_requests.load(Ordering::Relaxed),
+            blocked: self.blocked.load(Ordering::Relaxed),
+            #[allow(clippy::cast_precision_loss)] // 1 秒内样本数，f64 精确
+            qps: qps as f64,
         }
     }
 
     /// 最近 N 条告警（倒序，最新的在前）。
-    pub async fn recent_alerts(&self, n: usize) -> Vec<Alert> {
-        let inner = self.inner.lock().await;
+    #[must_use]
+    pub fn recent_alerts(&self, n: usize) -> Vec<Alert> {
+        let inner = self.lock();
         inner.alerts.iter().rev().take(n).cloned().collect()
+    }
+
+    /// 拿内部锁；中毒时恢复（单点 panic 不应拖垮统计）。
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -225,6 +250,7 @@ impl Default for AlertBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
 
     fn sample_alert() -> Alert {
         Alert::new(
@@ -243,18 +269,18 @@ mod tests {
         let bus = AlertBus::new();
 
         // 第一条：保留
-        bus.publish(sample_alert()).await;
+        let _ = bus.publish(sample_alert());
         // 完全相同的第二条（仅 time 可能不同）：略过，但 count 累加
-        bus.publish(sample_alert()).await;
+        let _ = bus.publish(sample_alert());
         // 不同 path：保留
         let mut other = sample_alert();
         other.path = "/?a=2".into();
-        bus.publish(other).await;
+        let _ = bus.publish(other);
 
-        let stats = bus.stats().await;
+        let stats = bus.stats();
         assert_eq!(stats.blocked, 3); // 计数全部累加
 
-        let recent = bus.recent_alerts(100).await;
+        let recent = bus.recent_alerts(100);
         assert_eq!(recent.len(), 2); // 但只保留 2 条（重复的被略过）
                                      // 第一条的 count 应为 2（1 原始 + 1 重复）
         assert_eq!(recent[0].count, 1); // 最新的是 /?a=2
@@ -264,13 +290,70 @@ mod tests {
     #[tokio::test]
     async fn non_consecutive_same_alert_keeps_both() {
         let bus = AlertBus::new();
-        bus.publish(sample_alert()).await;
+        let _ = bus.publish(sample_alert());
         let mut other = sample_alert();
         other.path = "/?x".into();
-        bus.publish(other).await;
+        let _ = bus.publish(other);
         // 第三条又和第一条相同——因为中间隔了一条，不算“连续重复”，应保留
-        bus.publish(sample_alert()).await;
+        let _ = bus.publish(sample_alert());
 
-        assert_eq!(bus.recent_alerts(100).await.len(), 3);
+        assert_eq!(bus.recent_alerts(100).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn block_response_hides_rule_details() {
+        // 拦截响应必须是不含规则命中的通用页，防止攻击者探测 WAF 规则（防指纹）
+        let resp = Alert::block_response(hyper::StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), hyper::StatusCode::FORBIDDEN);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(text, r#"{"action":"block"}"#);
+        // 不得泄漏路径/规则 id/分数/命中详情
+        for leaked in ["union select", "rule_id", "\"score\"", "\"hits\""] {
+            assert!(!text.contains(leaked), "拦截响应不应包含: {leaked}");
+        }
+    }
+
+    #[test]
+    fn default_bus_starts_empty() {
+        // Default 实现等价于 new()，且初始统计为零
+        let bus = AlertBus::default();
+        let s = bus.stats();
+        assert_eq!(s.total_requests, 0);
+        assert_eq!(s.blocked, 0);
+        assert!(s.qps < f64::EPSILON, "初始 QPS 应为 0，实际 {}", s.qps);
+        assert!(bus.recent_alerts(10).is_empty());
+    }
+
+    #[test]
+    fn alerts_history_capped_at_max() {
+        // 超过 MAX_ALERTS 条时淘汰最旧，但 blocked 计数仍精确
+        let bus = AlertBus::new();
+        for i in 0..(MAX_ALERTS + 50) {
+            let mut a = sample_alert();
+            a.path = format!("/?i={i}");
+            let _ = bus.publish(a);
+        }
+        assert_eq!(bus.recent_alerts(10000).len(), MAX_ALERTS);
+        assert_eq!(bus.stats().blocked, (MAX_ALERTS + 50) as u64);
+    }
+
+    #[test]
+    fn stats_prunes_stale_window_entries() {
+        // 手动塞入一个超过 1 秒的旧时间戳，stats() 应立即修剪，QPS 不含它
+        let bus = AlertBus::new();
+        {
+            let mut inner = bus.inner.lock().unwrap();
+            inner
+                .request_times
+                .push_back(Instant::now().checked_sub(Duration::from_secs(5)).unwrap());
+        }
+        let s = bus.stats();
+        assert!(
+            s.qps < f64::EPSILON,
+            "超过窗口的旧样本不应计入 QPS，实际 {}",
+            s.qps
+        );
     }
 }

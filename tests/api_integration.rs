@@ -240,16 +240,25 @@ async fn ws_alerts_pushes_alert_to_subscriber() {
     );
     let _ = bus.publish(alert);
 
-    // 收一条消息
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
-        .await
-        .expect("超时未收到 WS 告警")
-        .expect("WS 流结束")
-        .expect("WS 消息错误");
-    if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
-        assert!(text.contains("\"category\":\"xss\""), "text: {text}");
-    } else {
-        panic!("期望文本消息，收到 {msg:?}");
+    // 收消息：WS 控制帧（Ping/Pong）可能在告警前后到达，需跳过直到拿到 Text
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("超时未收到 WS 告警")
+            .expect("WS 流结束")
+            .expect("WS 消息错误");
+        match msg {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                assert!(text.contains("\"category\":\"xss\""), "text: {text}");
+                break;
+            }
+            // 控制帧与二进制帧与本次断言无关，继续等 Text
+            tokio_tungstenite::tungstenite::Message::Ping(_)
+            | tokio_tungstenite::tungstenite::Message::Pong(_)
+            | tokio_tungstenite::tungstenite::Message::Binary(_) => continue,
+            other => panic!("期望文本消息，收到 {other:?}"),
+        }
     }
 }
 

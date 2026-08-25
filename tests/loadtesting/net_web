@@ -1,0 +1,47 @@
+󰣇 ~ ❯ oha -z 30s -c 200 http://ddns.eipc.store:19192/
+Summary:
+  Success rate:	100.00%
+  Total:	30.0055 sec
+  Slowest:	25.1081 sec
+  Fastest:	0.0297 sec
+  Average:	0.7408 sec
+  Requests/sec:	246.0213
+
+  Total data:	2.65 MiB
+  Size/request:	387 B
+  Size/sec:	90.46 KiB
+
+Response time histogram:
+   0.030 sec [1]    |
+   2.538 sec [6657] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+   5.045 sec [383]  |■
+   7.553 sec [81]   |
+  10.061 sec [33]   |
+  12.569 sec [14]   |
+  15.077 sec [4]    |
+  17.585 sec [4]    |
+  20.092 sec [2]    |
+  22.600 sec [0]    |
+  25.108 sec [3]    |
+
+Response time distribution:
+  10.00% in 0.0420 sec
+  25.00% in 0.0483 sec
+  50.00% in 0.2285 sec
+  75.00% in 0.8156 sec
+  90.00% in 1.8838 sec
+  95.00% in 3.1576 sec
+  99.00% in 6.9884 sec
+  99.90% in 15.6663 sec
+  99.99% in 25.1081 sec
+
+
+Details (average, fastest, slowest):
+  DNS+dialup:	0.7819 sec, 0.0470 sec, 4.3254 sec
+  DNS-lookup:	0.0131 sec, 0.0022 sec, 0.0228 sec
+
+Status code distribution:
+  [200] 7182 responses
+
+Error distribution:
+  [200] aborted due to deadline

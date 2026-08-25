@@ -47,3 +47,27 @@
     那么 响应状态码应为 401
     当 客户端 GET /api/stats 且 Authorization 为 "Bearer qatest"
     那么 响应状态码应为 200
+
+  场景: Log4Shell JNDI 注入应被拦截
+    当 客户端 GET "/?q=${jndi:ldap://x}"
+    那么 响应状态码应为 403
+
+  场景: 扫描器 User-Agent 应被拦截
+    当 客户端 GET / 且 User-Agent 为 "sqlmap/1.7.8"
+    那么 响应状态码应为 403
+
+  场景: 敏感文件探测应被拦截
+    当 客户端 GET /.env
+    那么 响应状态码应为 403
+
+  场景: SSRF 云元数据访问应被拦截
+    当 客户端 GET "/?url=http://169.254.169.254/"
+    那么 响应状态码应为 403
+
+  场景: PHP webshell 上传应被拦截
+    当 客户端 POST body 为 "<?php eval($_POST[cmd]); ?>"
+    那么 响应状态码应为 403
+
+  场景: 弱信号单命中应放行（打分制组合）
+    当 客户端 GET /backup.sql
+    那么 响应状态码应为 200

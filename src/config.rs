@@ -73,4 +73,18 @@ mod tests {
         assert!(msg.contains("line"), "TOML 错误应包含行号: {msg}");
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn missing_cc_fields_fall_back_to_defaults() {
+        // cc_capacity / cc_refill_per_sec 缺省时使用默认 100 / 10
+        let path = std::env::temp_dir().join(format!("rg-def-config-{}.toml", std::process::id()));
+        std::fs::write(&path, "score_threshold = 30\n").unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.score_threshold, 30);
+        assert_eq!(cfg.cc_capacity, 100);
+        assert_eq!(cfg.cc_refill_per_sec, 10);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # RustGate QA 端到端功能测试
 set -u
-cd "$(dirname "$0")/.."
+# 无论从哪个目录调用，都切到仓库根目录（tests/qa/../..）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/../.."
 
 CFG=/tmp/rg-qa
 rm -rf "$CFG"; mkdir -p "$CFG"
@@ -23,7 +25,8 @@ BACK=$!
 sleep 0.5
 
 RUSTGATE_CONFIG_DIR="$CFG" RUSTGATE_BACKEND=http://127.0.0.1:18088 RUSTGATE_API_TOKEN=qatest \
-  RUSTGATE_API=127.0.0.1:19008 ./target/debug/rustgate waf 127.0.0.1:19009 > "$CFG/waf.log" 2>&1 &
+  RUSTGATE_API=127.0.0.1:19008 RUSTGATE_LISTEN=127.0.0.1:19009 \
+  ./target/debug/rustgate waf > "$CFG/waf.log" 2>&1 &
 WAF=$!
 sleep 1.5
 
@@ -46,6 +49,12 @@ check "路径穿越"                   403 "$(curl -s -o /dev/null -w '%{http_co
 check "命令注入"                   403 "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:19009/?q=;cat+/etc/passwd')"
 check "NUL 截断绕过"               403 "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:19009/?q=1+union%00select')"
 check "大body跨帧流式(300KB)"      200 "$(head -c 300000 /dev/zero | tr '\0' 'a' | curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @- http://127.0.0.1:19009/)"
+check "Log4Shell JNDI 注入"         403 "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:19009/?q=%24%7Bjndi%3Aldap%3A%2F%2Fx%7D')"
+check "扫描器 UA (sqlmap)"          403 "$(curl -s -o /dev/null -w '%{http_code}' -A 'sqlmap/1.7.8' http://127.0.0.1:19009/)"
+check "敏感文件探测 /.env"          403 "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19009/.env)"
+check "SSRF 云元数据"               403 "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:19009/?url=http%3A%2F%2F169.254.169.254%2F')"
+check "PHP webshell 上传"           403 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary '<?php eval($_POST[cmd]); ?>' http://127.0.0.1:19009/)"
+check "弱信号单命中放行(backup.sql)" 200 "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19009/backup.sql)"
 check "管理API鉴权失败"            401 "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19008/api/stats)"
 check "管理API鉴权成功"            200 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer qatest' http://127.0.0.1:19008/api/stats)"
 

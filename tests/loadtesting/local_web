@@ -1,0 +1,44 @@
+> oha -n 100000 -c 200 http://127.0.0.1:19192/
+Summary:
+  Success rate:	100.00%
+  Total:	7770.0937 ms
+  Slowest:	189.1669 ms
+  Fastest:	0.2183 ms
+  Average:	15.4985 ms
+  Requests/sec:	12869.8576
+
+  Total data:	33.95 MiB
+  Size/request:	356 B
+  Size/sec:	4.37 MiB
+
+Response time histogram:
+    0.218 ms [1]     |
+   19.113 ms [68397] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+   38.008 ms [17500] |■■■■■■■■
+   56.903 ms [11080] |■■■■■
+   75.798 ms [2046]  |
+   94.693 ms [757]   |
+  113.587 ms [158]   |
+  132.482 ms [43]    |
+  151.377 ms [11]    |
+  170.272 ms [5]     |
+  189.167 ms [2]     |
+
+Response time distribution:
+  10.00% in 1.5015 ms
+  25.00% in 2.6658 ms
+  50.00% in 5.5172 ms
+  75.00% in 28.5772 ms
+  90.00% in 42.2038 ms
+  95.00% in 50.2240 ms
+  99.00% in 75.5157 ms
+  99.90% in 106.9958 ms
+  99.99% in 141.6610 ms
+
+
+Details (average, fastest, slowest):
+  DNS+dialup:	6.9637 ms, 0.1029 ms, 13.9788 ms
+  DNS-lookup:	0.0040 ms, 0.0018 ms, 0.0201 ms
+
+Status code distribution:
+  [200] 100000 responses

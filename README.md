@@ -1,7 +1,6 @@
 # RustGate —— 基于 Rust 的 Web 应用防火墙（WAF）
 
 [![CI](https://github.com/ettry/rustgate/actions/workflows/ci.yml/badge.svg)](https://github.com/ettry/rustgate/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/ettry/rustgate/branch/main/graph/badge.svg)](https://codecov.io/gh/ettry/rustgate)
 
 RustGate 是一个高性能、可热加载规则的 Web 应用防火墙：
 反向代理流量 → 规则引擎检测 → 拦截或流式转发到后端。

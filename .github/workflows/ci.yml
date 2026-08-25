@@ -11,8 +11,12 @@ env:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    # rustsec/audit-check 需要创建 check-run，必须显式授予 checks: write
+    permissions:
+      contents: read
+      checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -20,7 +24,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -37,7 +41,10 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets
 
+      # rustls-pemfile 被标记 unmaintained（RUSTSEC-2025-0134），
+      # 该 advisory 是「维护状态」警告而非安全漏洞；当前版本稳定且无已知 CVE，予以忽略。
       - name: Security audit (cargo audit)
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2025-0134

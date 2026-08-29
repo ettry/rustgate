@@ -105,7 +105,7 @@ header = "User-Agent"       # 可选：仅 field="Header" 时按指定 header �
 ## 测试
 
 ```bash
-cargo test                                # 单元测试（当前 94 个：lib 35 + bin 24 + 集成 35）
+cargo test                                # 单元测试（当前 95 个：lib 35 + bin 24 + 集成 36）
 bash tests/qa/run_qa.sh                         # QA 端到端
 cargo llvm-cov --all-targets              # 覆盖率
 cargo clippy --all-targets -- -W clippy::cognitive_complexity   # 复杂度

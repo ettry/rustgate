@@ -275,6 +275,33 @@ async fn web_ui_contains_block_management() {
 }
 
 #[tokio::test]
+async fn block_management_endpoints_require_token() {
+    // 封禁管理的全部端点（列表/解封）无 token 必须 401，防止未授权操作
+    let (addr, _bus) = spawn_api("test-token").await;
+    let mut sender = connect(addr).await;
+
+    let (status, _) = request(&mut sender, "/api/blocked", None).await;
+    assert_eq!(
+        status,
+        hyper::StatusCode::UNAUTHORIZED,
+        "GET /api/blocked 无 token 应 401"
+    );
+
+    // DELETE 无 token → 401（即使 IP 非法也先由鉴权拦截）
+    let req = hyper::Request::builder()
+        .method(hyper::Method::DELETE)
+        .uri("/api/block/203.0.113.7")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        hyper::StatusCode::UNAUTHORIZED,
+        "DELETE /api/block 无 token 应 401"
+    );
+}
+
+#[tokio::test]
 async fn web_ui_escapes_attacker_controlled_fields() {
     let (addr, _bus) = spawn_api("test-token").await;
     let mut sender = connect(addr).await;

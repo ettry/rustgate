@@ -208,6 +208,32 @@ fn traversal_etc_passwd_blocked() {
 }
 
 #[test]
+fn traversal_backslash_variants_blocked() {
+    // 回归（RUST-01）：反斜杠穿越变体曾绕过规则 5（正则只匹配 ../）。
+    // 引擎先 URL 解码再匹配：..%5c 与原始 ..\ 解码后均为 ..\，
+    // Windows 后端 / 二次规范化服务会把它当路径分隔符，必须与 ../ 同等拦截。
+    assert_blocked(
+        "反斜杠穿越 ..%5c（编码）",
+        &inspect_get("/..%5c..%5csecret.txt", None, ""),
+    );
+    assert_blocked(
+        "反斜杠穿越 ..\\（原始）",
+        &inspect_get("/..\\..\\secret.txt", None, ""),
+    );
+    // 双重编码残留字面量：..%252f / ..%255c 解码一次后为 ..%2f / ..%5c
+    assert_blocked(
+        "双重编码穿越 ..%252f",
+        &inspect_get("/..%252f..%252fsecret", None, ""),
+    );
+    assert_blocked(
+        "双重编码穿越 ..%255c",
+        &inspect_get("/..%255c..%255csecret", None, ""),
+    );
+    // 误杀检查：正常路径中的单个点 / 点号结尾目录名（../ 已是既有语义）不受影响
+    assert_allowed("正常点号路径", &inspect_get("/v1.2/users", None, ""));
+}
+
+#[test]
 fn env_file_probe_blocked() {
     assert_blocked("/.env", &inspect_get("/.env", Some("curl/8.5.0"), ""));
 }

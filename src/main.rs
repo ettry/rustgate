@@ -1044,6 +1044,7 @@ async fn main() {
                                     client,
                                     bus,
                                     audit,
+                                    true,
                                 )
                                 .await;
                             }
@@ -1063,6 +1064,7 @@ async fn main() {
                                 client,
                                 bus,
                                 audit,
+                                false,
                             )
                             .await;
                         }
@@ -1107,6 +1109,7 @@ async fn serve_conn<I>(
     client: Arc<Client>,
     bus: Arc<AlertBus>,
     audit: AuditLogger,
+    frontend_tls: bool,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin,
 {
@@ -1131,6 +1134,7 @@ async fn serve_conn<I>(
                 client,
                 bus,
                 audit,
+                frontend_tls,
             )
             .await
             {
@@ -1288,6 +1292,7 @@ async fn handle(
     client: Arc<Client>,
     bus: Arc<AlertBus>,
     audit: AuditLogger,
+    frontend_tls: bool,
 ) -> Result<Response<BoxBody>, BoxError> {
     // 先解构 request，后面所有步骤都借用 parts 而不是克隆整张 HeaderMap / method / uri
     // （P5：每请求省去一次完整 HeaderMap + Method + Uri 克隆）。
@@ -1394,7 +1399,7 @@ async fn handle(
         },
     };
     let out_req = Request::from_parts(parts, body);
-    forward(client, backend, out_req, ip).await
+    forward(client, backend, out_req, ip, frontend_tls).await
 }
 
 /// body 前缀读取结果：检测所需的头部字节 + 暂存的已读数据帧 + 剩余流。
@@ -1584,8 +1589,14 @@ fn connection_hop_tokens(headers: &hyper::HeaderMap) -> Vec<String> {
 
 /// 判断某个请求头是否应透传给后端。
 ///
-/// 排除：`Host`（由目标 URI 决定）、逐跳头、`Connection` 点名的头、
-/// 以及可被客户端伪造的 `X-Forwarded-For` / `X-Real-IP`。
+/// 排除：`Host`（由目标 URI 决定）、逐跳头、`Connection` 点名的头，
+/// 以及可被客户端伪造的来源/协议头——`X-Forwarded-For` / `X-Real-IP` /
+/// `X-Forwarded-Proto` / `X-Forwarded-Host` / `X-Forwarded-Port` /
+/// `X-Forwarded-Server` / `X-Forwarded-Scheme` / `Forwarded`。
+///
+/// 若后端信任这些头生成绝对 URL、重定向或协议/主机判定，
+/// 透传伪造值会被欺骗（如伪 `X-Forwarded-Proto: https` 诱发开放重定向）。
+/// 其中 `X-Forwarded-For` 与 `X-Forwarded-Proto` 由 WAF 按真实值重写后写入。
 #[must_use]
 fn is_forwardable_header(name: &hyper::header::HeaderName, hop_tokens: &[String]) -> bool {
     if name == hyper::header::HOST {
@@ -1597,7 +1608,17 @@ fn is_forwardable_header(name: &hyper::header::HeaderName, hop_tokens: &[String]
     if hop_tokens.iter().any(|t| t == name.as_str()) {
         return false;
     }
-    !matches!(name.as_str(), "x-forwarded-for" | "x-real-ip")
+    !matches!(
+        name.as_str(),
+        "x-forwarded-for"
+            | "x-real-ip"
+            | "x-forwarded-proto"
+            | "x-forwarded-host"
+            | "x-forwarded-port"
+            | "x-forwarded-server"
+            | "x-forwarded-scheme"
+            | "forwarded"
+    )
 }
 
 /// 剥离响应头里的逐跳头（S4：后端响应透传前清洗，RFC 7230 §6.1）。
@@ -1613,11 +1634,16 @@ fn strip_response_hop_by_hop(headers: &mut hyper::HeaderMap) {
 }
 
 /// 把规范化后的请求转发给受保护的后端，响应体流式透传。
+///
+/// `frontend_tls`：WAF 前端（客户端↔WAF）是否走 TLS，用于重写
+/// `X-Forwarded-Proto`——入站的该头（连同其它 `X-Forwarded-*` / `Forwarded`）
+/// 已被当作可伪造头剥离，后端只能看到 WAF 写入的真实值。
 async fn forward<B>(
     client: Arc<Client>,
     backend: String,
     req: Request<B>,
     client_ip: String,
+    frontend_tls: bool,
 ) -> Result<Response<BoxBody>, BoxError>
 where
     B: Body<Data = Bytes, Error = BoxError> + Send + Sync + 'static,
@@ -1636,7 +1662,8 @@ where
         .uri(target)
         .version(parts.version);
     // 头部透传（零拷贝，不建中间 HeaderMap）：
-    // 剥离逐跳头与伪造 XFF/X-Real-IP，Host 交给后端目标决定。
+    // 剥离逐跳头与可伪造的 X-Forwarded-* / Forwarded / X-Real-IP，
+    // Host 交给后端目标决定。
     let hop_tokens = connection_hop_tokens(&parts.headers);
     for (k, v) in &parts.headers {
         if is_forwardable_header(k, &hop_tokens) {
@@ -1647,6 +1674,12 @@ where
     if let Ok(v) = hyper::header::HeaderValue::from_str(&client_ip) {
         builder = builder.header("x-forwarded-for", v);
     }
+    // 重写 X-Forwarded-Proto 为 WAF 前端真实协议：后端据此做协议判定
+    // （生成绝对 URL / 重定向）时不能被客户端伪造的入站值欺骗。
+    builder = builder.header(
+        "x-forwarded-proto",
+        if frontend_tls { "https" } else { "http" },
+    );
     let out_req = builder.body(body.boxed())?;
 
     // 响应体(Incoming)流式透传，转成统一 BoxBody 返回；
@@ -1791,20 +1824,25 @@ mod forward_header_tests {
         h
     }
 
-    /// 复刻 [`forward`] 里对请求头的处理：逐个判定 + 重写 XFF。
-    /// 返回「应透传」的头集合 + 重写后的 XFF 值（用于测试 forward 的清洗语义）。
+    /// 复刻 [`forward`] 里对请求头的处理：逐个判定 + 重写 XFF/X-Forwarded-Proto。
+    ///
+    /// 返回（应透传的头, 因可伪造被剥离的头）。Host、逐跳头与 `Connection`
+    /// 点名头属于另一类剥离，不计入第二项。
     fn forwardable(headers: &hyper::HeaderMap) -> (Vec<String>, Vec<String>) {
         let hop = connection_hop_tokens(headers);
         let mut keep = Vec::new();
-        let mut xff = Vec::new();
+        let mut forged = Vec::new();
         for (k, v) in headers {
             if is_forwardable_header(k, &hop) {
                 keep.push(format!("{}: {}", k, v.to_str().unwrap()));
-            } else if k.as_str() == "x-forwarded-for" || k.as_str() == "x-real-ip" {
-                xff.push(k.as_str().to_string());
+            } else if k != hyper::header::HOST
+                && !HOP_BY_HOP_HEADERS.contains(&k.as_str())
+                && !hop.iter().any(|t| t == k.as_str())
+            {
+                forged.push(k.as_str().to_string());
             }
         }
-        (keep, xff)
+        (keep, forged)
     }
 
     #[test]
@@ -1842,6 +1880,57 @@ mod forward_header_tests {
         assert!(keep.iter().any(|l| l == "user-agent: curl/8"));
         // XFF/X-Real-IP 被识别为需重写/删除
         assert_eq!(forged, vec!["x-forwarded-for", "x-real-ip"]);
+    }
+
+    #[test]
+    fn strips_spoofable_forwarded_and_proto_headers() {
+        // 回归（RUST-02）：客户端可伪造的 X-Forwarded-* / Forwarded 协议与
+        // 主机头必须全部剥离，后端只能看到 WAF 重写的真实值。
+        let h = mk_headers(&[
+            ("x-forwarded-for", "6.6.6.6"),
+            ("x-real-ip", "8.8.8.8"),
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "evil.example.com"),
+            ("x-forwarded-port", "8443"),
+            ("x-forwarded-scheme", "https"),
+            ("forwarded", "for=6.6.6.6;proto=https;host=evil.example.com"),
+            ("user-agent", "curl/8"),
+        ]);
+        let (keep, forged) = forwardable(&h);
+
+        // 任何可伪造的来源/协议头都不透传
+        for name in [
+            "x-forwarded-for",
+            "x-real-ip",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "x-forwarded-port",
+            "x-forwarded-scheme",
+            "forwarded",
+        ] {
+            assert!(
+                !keep.iter().any(|l| l.starts_with(&format!("{name}:"))),
+                "{name} 不应透传: {keep:?}"
+            );
+        }
+        assert!(keep.iter().any(|l| l == "user-agent: curl/8"));
+
+        // 全部被归类为「可伪造剥离」（排序比较，避免 HeaderMap 迭代顺序差异）
+        let mut sorted = forged.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec![
+                "forwarded",
+                "x-forwarded-for",
+                "x-forwarded-host",
+                "x-forwarded-port",
+                "x-forwarded-proto",
+                "x-forwarded-scheme",
+                "x-real-ip",
+            ],
+            "可伪造头应全部被剥离: {forged:?}"
+        );
     }
 
     #[test]
@@ -2136,10 +2225,11 @@ mod security_helper_tests {
     // ---------- forward 端到端 ----------
 
     #[tokio::test]
-    async fn forward_rewrites_xff_and_strips_host() {
+    async fn forward_rewrites_xff_and_proto_strips_spoofed() {
         // 与 main() 启动一致：注册 rustls 默认 CryptoProvider（ring）
         let _ = rustls::crypto::ring::default_provider().install_default();
-        // 起一个极简后端，回显收到的 x-forwarded-for / user-agent / host
+        // 起一个极简后端，回显收到的 x-forwarded-for / x-forwarded-proto /
+        // user-agent / host（用于验证 forward 的头清洗与重写语义）
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2157,8 +2247,9 @@ mod security_helper_tests {
                             .to_string()
                     };
                     let body = format!(
-                        "xff={}|ua={}|host={}",
+                        "xff={}|xfp={}|ua={}|host={}",
                         h("x-forwarded-for"),
+                        h("x-forwarded-proto"),
                         h("user-agent"),
                         h("host")
                     );
@@ -2179,7 +2270,8 @@ mod security_helper_tests {
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
                 .build(https_connector()),
         );
-        // 客户端伪造 XFF 与 Host，forward 必须重写/剥离
+        // 客户端伪造 XFF / X-Forwarded-* / Forwarded / Host，forward 必须
+        // 重写 XFF 与 X-Forwarded-Proto、剥离其余可伪造头
         let body: BoxBody = Full::new(Bytes::new())
             .map_err(|never: Infallible| match never {})
             .boxed();
@@ -2187,13 +2279,22 @@ mod security_helper_tests {
             .uri("/index.html")
             .header("user-agent", "curl/8")
             .header("x-forwarded-for", "6.6.6.6")
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-host", "evil.example.com")
+            .header("forwarded", "for=6.6.6.6;proto=https;host=evil.example.com")
             .header("host", "evil.example.com")
             .body(body)
             .unwrap();
 
-        let resp = forward(client, format!("http://{addr}"), req, "9.9.9.9".to_string())
-            .await
-            .unwrap();
+        let resp = forward(
+            client,
+            format!("http://{addr}"),
+            req,
+            "9.9.9.9".to_string(),
+            false,
+        )
+        .await
+        .unwrap();
         let text = resp.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&text).into_owned();
 
@@ -2201,10 +2302,14 @@ mod security_helper_tests {
             text.contains("xff=9.9.9.9"),
             "XFF 应被重写为真实 IP: {text}"
         );
+        assert!(
+            text.contains("xfp=http"),
+            "X-Forwarded-Proto 应重写为 WAF 前端真实协议 http: {text}"
+        );
         assert!(text.contains("ua=curl/8"), "端到端头应透传: {text}");
         assert!(
             !text.contains("evil.example.com"),
-            "伪造 Host 不应透传: {text}"
+            "伪造 Host / X-Forwarded-Host / Forwarded 不应透传: {text}"
         );
     }
 }

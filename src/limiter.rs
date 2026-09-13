@@ -6,6 +6,9 @@
 //! * 临界区内无 await，使用同步锁（比异步锁快，无任务调度开销），
 //!   因此 `check` / `tokens_left` 都是同步方法；
 //! * 定期清理超时未活跃的桶，防止伪造海量源 IP 导致内存膨胀；
+//! * **桶数硬上限**（[`SHARD_MAX_BUCKETS`]）：时间门控清理存在最长
+//!   [`CLEANUP_INTERVAL`] 的空窗，可信代理后伪造海量 XFF IP 可在窗口内
+//!   无限建桶；硬上限在插入前即时逐出最旧桶，保证内存恒有界；
 //! * 锁中毒时通过 `into_inner` 恢复，不让单点 panic 拖垮 WAF 进程。
 
 use std::collections::hash_map::DefaultHasher;
@@ -22,8 +25,18 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 /// 分片数：把全局锁切成多把，降低并发竞争。
 /// 每片清理阈值 = 1024 / SHARDS，保持与旧版全局行为等量。
 const SHARDS: usize = 16;
-/// 每个分片的桶数阈值（触发清理）。
+/// 每个分片的桶数阈值（触发时间门控清理）。
 const SHARD_CLEANUP_THRESHOLD: usize = 1024 / SHARDS;
+/// 每个分片的桶数硬上限：达到后立即逐出最旧的四分之一桶（全局 4096）。
+///
+/// 时间门控清理（阈值 + 间隔）负责常态回收，但在两次清理之间最多有
+/// [`CLEANUP_INTERVAL`] 的空窗；若攻击者（可信代理后伪造海量 XFF IP）
+/// 以每请求一个新 IP 的速率洪泛，窗口内桶数会无界增长。
+/// 硬上限补上这个洞：插入新桶前检查，超限即逐出最旧桶，内存恒有界。
+/// 闲置越久的桶越先被逐出，正常活跃桶基本不受影响；
+/// 超过该容量的部署（>4096 个并发活跃 IP）应同步调大本常量与
+/// [`SHARD_CLEANUP_THRESHOLD`]。
+const SHARD_MAX_BUCKETS: usize = 256;
 
 /// 每个分片的独立状态：桶表 + 上次清理时间。
 /// 时间戳放在同一个 Mutex 里，避免额外加锁。
@@ -79,6 +92,12 @@ impl RateLimiter {
             shard.last_cleanup = now;
         }
 
+        // 硬上限兜底：清理间隔的空窗内桶数也不能无界增长
+        // （防「可信代理后伪造海量 XFF IP」洪泛撑爆内存）。
+        if shard.buckets.len() >= SHARD_MAX_BUCKETS {
+            evict_oldest_quarter(&mut shard.buckets);
+        }
+
         let b = shard.buckets.entry(ip.to_string()).or_insert(Bucket {
             tokens: self.capacity,
             last: now,
@@ -120,6 +139,26 @@ fn shard_index(ip: &str) -> usize {
     let mut h = DefaultHasher::new();
     h.write(ip.as_bytes());
     (h.finish() as usize) % SHARDS
+}
+
+/// 逐出最旧的四分之一桶（按 `last` 活跃时间）。
+///
+/// 用 `select_nth_unstable` 找第 1/4 旧分位的时间点，再整表 `retain`：
+/// * 闲置越久的桶越先被逐出，正常活跃桶（最近有请求）天然保留；
+/// * 洪泛场景（所有桶 `last` 都很新甚至相同）也保证至少逐出四分之一，
+///   硬上限始终有效——被逐的正常桶下次请求会按容量重建，只损失一次
+///   突发余量，不会拒绝服务。
+fn evict_oldest_quarter(buckets: &mut HashMap<String, Bucket>) {
+    let evict = buckets.len() / 4;
+    if evict == 0 {
+        return;
+    }
+    let mut times: Vec<Instant> = buckets.values().map(|b| b.last).collect();
+    // 第 evict 旧的时间点（0-based 下标 evict-1）：
+    // select_nth 保证至少 evict 个值 <= 它，retain 用严格大于即可逐出足量。
+    times.select_nth_unstable_by_key(evict - 1, |t| *t);
+    let cutoff = times[evict - 1];
+    buckets.retain(|_, b| b.last > cutoff);
 }
 
 #[cfg(test)]
@@ -300,5 +339,66 @@ mod tests {
         // 正确逻辑（&&）：桶数 < 阈值 → 不清理 → 过期桶保留，共 6 个
         // 若被变异成 ||，则过期桶被回收 → 只剩 2 个
         assert_eq!(shard.buckets.len(), 6, "未达阈值不应触发全表清理");
+    }
+
+    #[test]
+    fn hard_cap_evicts_oldest_and_bounds_memory() {
+        // 回归（RUST-03）：分片桶数达到硬上限时必须逐出最旧桶，内存有界。
+        // 直接构造超限分片：190 个早已闲置的旧桶 + 远超上限总数的新桶。
+        let rl = RateLimiter::new(10, 0);
+        let idx = shard_index("1.2.3.4");
+        {
+            let mut shard = rl.shards[idx].lock().unwrap();
+            for i in 0..(SHARD_MAX_BUCKETS + 4) {
+                shard.buckets.insert(
+                    format!("10.0.{i}.1"),
+                    Bucket {
+                        tokens: 1,
+                        // 前 190 个早已闲置（会被逐出），其余刚刚活跃（应保留）
+                        last: if i < 190 { past(400) } else { Instant::now() },
+                    },
+                );
+            }
+            assert_eq!(shard.buckets.len(), SHARD_MAX_BUCKETS + 4);
+        }
+
+        // 触发一次 check：硬上限应逐出一批桶（时间门控清理因间隔未到不参与）
+        assert!(!rl.check("1.2.3.4"));
+
+        let shard = rl.shards[idx].lock().unwrap();
+        assert!(
+            shard.buckets.len() <= SHARD_MAX_BUCKETS,
+            "桶数必须被限制在硬上限内，实际 {}",
+            shard.buckets.len()
+        );
+        // 闲置桶被逐出、活跃桶保留（70 个新桶 + 刚插入的 1.2.3.4）
+        let active = shard
+            .buckets
+            .values()
+            .filter(|b| b.last > past(300))
+            .count();
+        assert!(active >= 65, "活跃桶应基本保留，实际 {active}");
+    }
+
+    #[test]
+    fn flood_of_new_ips_never_exceeds_hard_cap() {
+        // 回归（RUST-03）：模拟「每请求一个新 IP」洪泛（可信代理后伪造 XFF），
+        // 插入 2 倍于全局硬上限总量的不同 IP，总桶数仍不得超过上限总量。
+        let rl = RateLimiter::new(10, 0);
+        let flood = SHARD_MAX_BUCKETS * SHARDS * 2;
+        for i in 0..flood {
+            let _ = rl.check(&format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256));
+        }
+
+        let total: usize = rl
+            .shards
+            .iter()
+            .map(|s| s.lock().unwrap().buckets.len())
+            .sum();
+        assert!(
+            total <= SHARD_MAX_BUCKETS * SHARDS,
+            "洪泛 {flood} 个 IP 后总桶数 {total} 应 <= 硬上限总量 {}",
+            SHARD_MAX_BUCKETS * SHARDS
+        );
     }
 }
